@@ -618,6 +618,13 @@ def _tts_to_file_speed(*, text: str, language: str, file_path: Path, speed: floa
         wav = tts_model.generate(text, **gen_kwargs)  # type: ignore
         sr = int(getattr(tts_model, "sr", 24000))
         _save_wav_tensor_to_file(wav, file_path, sr)
+        del wav  # release the output tensor before the lock drops
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _cleanup_old_jobs():
@@ -855,6 +862,7 @@ def _srt_to_audio_file(*, cues, lang: str, fmt: str, tts_kwargs: dict, progress_
         raise RuntimeError("No valid subtitle cues found to synthesize.")
 
     audio = np.concatenate(parts) if len(parts) > 1 else parts[0]
+    del parts  # free per-cue buffers; only the concatenated array is needed now
     sf.write(wav_out, audio, sr)
 
     if fmt == "wav":
@@ -1314,8 +1322,25 @@ def cancel_srt_job(job_id: str):
 # Startup
 # ---------------------------------------------------------------------------
 
+def _start_job_cleanup_scheduler(interval_sec: int = 1800):
+    """
+    Periodically prune stale SRT job entries from SRT_JOBS and SRT_JOB_CONTROLS.
+
+    Without this, entries only get cleaned when an SRT API endpoint is hit.
+    On idle servers the dicts would grow indefinitely. The scheduler runs as a
+    daemon thread so it never blocks a clean process exit.
+    """
+    def _loop():
+        while True:
+            time.sleep(interval_sec)
+            _cleanup_old_jobs()
+    t = threading.Thread(target=_loop, daemon=True, name="job-cleanup-scheduler")
+    t.start()
+
+
 if __name__ == "__main__":
     # Load model in background thread so the server starts immediately
     t = threading.Thread(target=load_model, daemon=True)
     t.start()
+    _start_job_cleanup_scheduler()
     app.run(debug=False, host="0.0.0.0", port=5001)

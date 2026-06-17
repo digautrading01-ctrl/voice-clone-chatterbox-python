@@ -3,10 +3,11 @@
    ========================================================= */
 
 // List of uploaded reference clips: [{ref_id, name, objectUrl}, ...]
-let currentRefIds = [];
-let modelReady    = false;
-let runtimeDevice = null; // "cpu" | "cuda" | ...
+let currentRefIds  = [];
+let modelReady     = false;
+let runtimeDevice  = null; // "cpu" | "cuda" | ...
 let activeSrtJobId = null;
+let srtPollTimeout = null; // handle returned by setTimeout for the active SRT poll loop
 
 // ── Helpers ────────────────────────────────────────────────
 
@@ -487,7 +488,7 @@ if (srtBtn) {
 
         if (j.status === "paused") {
           setStatus(status, "Paused — click Resume to continue.", "loading");
-          setTimeout(poll, 1000);
+          srtPollTimeout = setTimeout(poll, 1000);
           return;
         }
         if (j.status === "canceled") {
@@ -526,10 +527,10 @@ if (srtBtn) {
           updateSrtButtonState();
           return;
         }
-        setTimeout(poll, 1000);
+        srtPollTimeout = setTimeout(poll, 1000);
       };
 
-      setTimeout(poll, 750);
+      srtPollTimeout = setTimeout(poll, 750);
     } catch (e) {
       activeSrtJobId = null;
       setSrtJobControlsState({ visible: false });
@@ -573,3 +574,17 @@ async function deleteOutput(name) {
   const el = document.getElementById("item-" + name);
   if (el) el.remove();
 }
+
+// ── Page-unload cleanup ────────────────────────────────────
+// Revoke all blob URLs held for reference audio clips so the browser
+// can free the pinned file buffers, and cancel any in-flight SRT poll
+// loop so its closure (and captured DOM references) can be GC'd.
+window.addEventListener("beforeunload", () => {
+  if (srtPollTimeout !== null) {
+    clearTimeout(srtPollTimeout);
+    srtPollTimeout = null;
+  }
+  currentRefIds.forEach(item => {
+    if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+  });
+});
