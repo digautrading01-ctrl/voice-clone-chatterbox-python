@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Clone</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="title-row">
+      <h1>Voice Clone</h1>
+      <span id="deviceBadge" class="device-badge loading" title="Runtime device">Detecting…</span>
+    </div>
+    <p class="subtitle">Powered by chatterbox-tts &nbsp;·&nbsp; Supports Chinese &amp; English</p>
+
+    <!-- Model status -->
+    <div id="modelBanner" class="banner loading">
+      Loading model, please wait…
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="clone">Voice Cloning (Reference Audio)</button>
+      <button class="tab" data-tab="builtin">Default Voice</button>
+      <button class="tab" data-tab="srt">Subtitles (.srt)</button>
+      <button class="tab" data-tab="history">History</button>
+    </div>
+
+    <!-- ── Tab: Clone ── -->
+    <div class="tab-panel active" id="tab-clone">
+
+      <section class="card">
+        <h2>① Upload Reference Audio</h2>
+        <p class="hint">
+          Upload a reference clip (3–30 s) of clear speech (WAV / MP3 / FLAC).
+          Only the first uploaded clip is used for voice conditioning.
+        </p>
+        <div class="ref-upload-row">
+          <input type="file" id="refFile" accept="audio/*" multiple />
+          <button id="addRefBtn" class="btn secondary">Add Clip(s)</button>
+        </div>
+        <div id="refStatus" class="status"></div>
+        <div id="refList" class="ref-list"></div>
+      </section>
+
+      <section class="card">
+        <h2>② Enter Text</h2>
+        <div class="field-row">
+          <label>Language
+            <select id="cloneLang">
+              <option value="en">English</option>
+              <option value="zh">Chinese</option>
+            </select>
+          </label>
+        </div>
+        <textarea id="cloneText" rows="5" placeholder="Enter the text you want to synthesize…"></textarea>
+        <button id="synthesizeBtn" class="btn primary" disabled>Generate Speech</button>
+        <div id="synthStatus" class="status"></div>
+      </section>
+
+      <section class="card hidden" id="cloneResultCard">
+        <h2>③ Preview &amp; Download</h2>
+        <div class="audio-wrap">
+          <audio id="cloneAudio" controls></audio>
+        </div>
+        <a id="cloneDownload" class="btn primary" download>Download WAV</a>
+      </section>
+
+    </div>
+
+    <!-- ── Tab: Built-in ── -->
+    <div class="tab-panel hidden" id="tab-builtin">
+      <section class="card">
+        <h2>Default Voice Synthesis</h2>
+        <p class="hint">No reference audio needed — chatterbox-tts will synthesize using its default voice.</p>
+
+        <div class="field-row">
+          <label>Speaker
+            <select id="speakerSelect"><option>Loading…</option></select>
+          </label>
+          <label>Language
+            <select id="builtinLang">
+              <option value="en">English</option>
+              <option value="zh">Chinese</option>
+            </select>
+          </label>
+        </div>
+
+        <textarea id="builtinText" rows="5" placeholder="Enter text to synthesize…"></textarea>
+        <button id="builtinSynthBtn" class="btn primary" disabled>Generate Speech</button>
+        <div id="builtinStatus" class="status"></div>
+      </section>
+
+      <section class="card hidden" id="builtinResultCard">
+        <h2>Preview &amp; Download</h2>
+        <div class="audio-wrap">
+          <audio id="builtinAudio" controls></audio>
+        </div>
+        <a id="builtinDownload" class="btn primary" download>Download WAV</a>
+      </section>
+    </div>
+
+    <!-- ── Tab: Subtitles (.srt) ── -->
+    <div class="tab-panel hidden" id="tab-srt">
+      <section class="card">
+        <h2>Generate Audio from Subtitles (.srt)</h2>
+        <p class="hint">
+          Upload an <code>.srt</code> file and generate a single audio track (WAV or MP3).
+          The app aligns segments by subtitle start times, and tries to fit speech into short cues with minimal pitch artifacts.
+          In clone mode, all reference clips uploaded in the Voice Cloning tab are used.
+        </p>
+
+        <div class="field-row">
+          <label>Subtitles file
+            <input type="file" id="srtFile" accept=".srt" />
+          </label>
+        </div>
+
+        <div class="field-row">
+          <label style="display:flex;gap:.75rem;align-items:center;">
+            <input type="radio" name="srtMode" value="clone" checked />
+            Use uploaded reference audio (<span id="srtRefCount">0</span> clip(s))
+          </label>
+          <label style="display:flex;gap:.75rem;align-items:center;">
+            <input type="radio" name="srtMode" value="builtin" />
+            Use default voice (no reference)
+          </label>
+        </div>
+
+        <div class="field-row hidden" id="srtBuiltinWrap">
+          <label>Speaker
+            <select id="srtSpeakerSelect"><option>Loading…</option></select>
+          </label>
+        </div>
+
+        <div class="field-row">
+          <label>Language
+            <select id="srtLang">
+              <option value="en">English</option>
+              <option value="zh">Chinese</option>
+            </select>
+          </label>
+          <label>Output format
+            <select id="srtFormat">
+              <option value="wav">WAV</option>
+              <option value="mp3">MP3</option>
+            </select>
+          </label>
+        </div>
+
+        <button id="srtGenerateBtn" class="btn primary" disabled>Generate from SRT</button>
+        <div id="srtStatus" class="status"></div>
+
+        <div id="srtProgressWrap" class="progress-wrap hidden">
+          <div class="progress">
+            <div id="srtProgressBar" class="progress-bar" style="width:0%"></div>
+          </div>
+          <div id="srtProgressText" class="progress-text"></div>
+          <div id="srtJobControls" class="job-controls hidden">
+            <button id="srtPauseResumeBtn" type="button" class="btn secondary">Pause</button>
+            <button id="srtCancelBtn" type="button" class="btn danger">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card hidden" id="srtResultCard">
+        <h2>Preview &amp; Download</h2>
+        <div class="audio-wrap">
+          <audio id="srtAudio" controls></audio>
+        </div>
+        <a id="srtDownload" class="btn primary" download>Download</a>
+      </section>
+    </div>
+
+    <!-- ── Tab: History ── -->
+    <div class="tab-panel hidden" id="tab-history">
+      <section class="card">
+        <h2>Generated Files</h2>
+        <button id="refreshHistoryBtn" class="btn secondary">Refresh</button>
+        <div id="historyList" class="history-list"></div>
+      </section>
+    </div>
+
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

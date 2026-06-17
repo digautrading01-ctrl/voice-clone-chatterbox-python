@@ -1,0 +1,6 @@
+flask>=3.0.0
+chatterbox-tts>=0.1.7
+torch>=2.0.0
+torchaudio>=2.0.0
+soundfile>=0.12.1
+numpy>=1.23.0
