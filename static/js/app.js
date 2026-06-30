@@ -22,6 +22,17 @@ function fmtBytes(b) {
   return (b / 1024 / 1024).toFixed(1) + " MB";
 }
 
+function getMaxCharsValue(inputId) {
+  const el = document.getElementById(inputId);
+  if (!el) return null;
+  const raw = (el.value || "").trim();
+  if (!raw) return null; // Auto
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return null;
+  // Keep consistent with backend clamping.
+  return Math.max(80, Math.min(1200, n));
+}
+
 async function apiFetch(path, body) {
   const res = await fetch(path, {
     method: "POST",
@@ -198,6 +209,7 @@ document.getElementById("synthesizeBtn").addEventListener("click", async () => {
   const text   = document.getElementById("cloneText").value.trim();
   const lang   = document.getElementById("cloneLang").value;
   const status = document.getElementById("synthStatus");
+  const maxChars = getMaxCharsValue("maxChars");
 
   if (!text)               { setStatus(status, "Please enter some text.", "err"); return; }
   if (!currentRefIds.length) { setStatus(status, "Please upload at least one reference audio clip first.", "err"); return; }
@@ -210,6 +222,7 @@ document.getElementById("synthesizeBtn").addEventListener("click", async () => {
       text,
       ref_ids: currentRefIds.map(r => r.ref_id),
       lang,
+      max_chars: maxChars,
     });
 
     if (data.error) {
@@ -268,6 +281,7 @@ document.getElementById("builtinSynthBtn").addEventListener("click", async () =>
   const speaker = document.getElementById("speakerSelect").value;
   const lang    = document.getElementById("builtinLang").value;
   const status  = document.getElementById("builtinStatus");
+  const maxChars = getMaxCharsValue("maxCharsBuiltin");
 
   if (!text) { setStatus(status, "Please enter some text.", "err"); return; }
 
@@ -275,7 +289,7 @@ document.getElementById("builtinSynthBtn").addEventListener("click", async () =>
   document.getElementById("builtinSynthBtn").disabled = true;
 
   try {
-    const data = await apiFetch("/synthesize-builtin", { text, speaker, lang });
+    const data = await apiFetch("/synthesize-builtin", { text, speaker, lang, max_chars: maxChars });
 
     if (data.error) {
       setStatus(status, "Error: " + data.error, "err");

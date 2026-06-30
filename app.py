@@ -615,6 +615,10 @@ def _tts_to_file_speed(*, text: str, language: str, file_path: Path, speed: floa
             gen_kwargs["language_id"] = lang_id
         if audio_prompt_path:
             gen_kwargs["audio_prompt_path"] = audio_prompt_path
+        # Prevent occasional AI hallucination in form of gibberish and repetition near sentence boundaries.
+        gen_kwargs["temperature"] = 0.5
+        gen_kwargs["repetition_penalty"] = 1.5
+
         wav = tts_model.generate(text, **gen_kwargs)  # type: ignore
         sr = int(getattr(tts_model, "sr", 24000))
         _save_wav_tensor_to_file(wav, file_path, sr)
@@ -625,6 +629,193 @@ def _tts_to_file_speed(*, text: str, language: str, file_path: Path, speed: floa
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Intelligent text chunking (non-SRT synthesis)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r"""          # keep delimiter
+    (.*?          # sentence body (non-greedy)
+     [\.\!\?\u3002\uFF01\uFF1F\u2026]+   # . ! ? 。 ！ ？ …
+    )\s+          # whitespace after punctuation
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    """
+    Best-effort sentence splitter for English + Chinese punctuation.
+
+    We keep terminal punctuation with the sentence, and fall back to returning
+    the whole text if nothing matches.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    # Normalize whitespace to improve splitting stability.
+    t = re.sub(r"\s+", " ", t).strip()
+
+    out: list[str] = []
+    pos = 0
+    for m in _SENTENCE_SPLIT_RE.finditer(t):
+        s = (m.group(1) or "").strip()
+        if s:
+            out.append(s)
+        pos = m.end()
+    tail = t[pos:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _chunk_text_for_tts(text: str, *, max_chars: int = 260) -> list[str]:
+    """
+    Chunk text to reduce long-sentence truncation in some TTS generations.
+
+    Strategy:
+    - Prefer sentence boundaries first
+    - If a single sentence is still too long, split further on commas/semicolons
+    - If still too long, split by character length (hard fallback)
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    sentences = _split_into_sentences(t)
+    if not sentences:
+        sentences = [t]
+
+    chunks: list[str] = []
+
+    def push(s: str):
+        s = (s or "").strip()
+        if s:
+            chunks.append(s)
+
+    for sent in sentences:
+        s = sent.strip()
+        if len(s) <= max_chars:
+            push(s)
+            continue
+
+        # Secondary split on comma-like punctuation.
+        parts = re.split(r"(?<=[,;:\uFF0C\uFF1B\uFF1A])\s*", s)
+        buf = ""
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if not buf:
+                buf = part
+                continue
+            if len(buf) + 1 + len(part) <= max_chars:
+                buf = buf + " " + part
+            else:
+                push(buf)
+                buf = part
+        push(buf)
+
+    # Hard fallback: break any remaining overlong chunks by length.
+    final: list[str] = []
+    for c in chunks:
+        c = c.strip()
+        if len(c) <= max_chars:
+            final.append(c)
+            continue
+        for i in range(0, len(c), max_chars):
+            seg = c[i : i + max_chars].strip()
+            if seg:
+                final.append(seg)
+
+    return final
+
+
+def _parse_int_env(name: str, *, default: int | None = None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    try:
+        v = int(v)
+    except Exception:
+        return lo
+    return max(lo, min(hi, v))
+
+
+def _default_max_chars() -> int:
+    """
+    Default chunk size for non-SRT synthesis.
+    - Can be configured via env var VOICECLONE_MAX_CHARS
+    - Clamped to a safe range to avoid extreme values
+    """
+    v = _parse_int_env("VOICECLONE_MAX_CHARS", default=260)
+    return _clamp_int(v if v is not None else 260, 80, 1200)
+
+
+def _require_pydub():
+    try:
+        from pydub import AudioSegment  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Missing dependency for intelligent text chunking. Install requirements first:\n"
+            "  pip install -r requirements.txt\n"
+            f"Details: {e}"
+        )
+    return AudioSegment
+
+
+def _tts_to_file_chunked(*, text: str, language: str, file_path: Path, tts_kwargs: dict, max_chars: int | None = None):
+    """
+    Render text to a WAV file using sentence-based chunking and stitch with pydub.
+
+    This is used for the non-SRT endpoints to reduce occasional truncation on
+    long sentences.
+    """
+    AudioSegment = _require_pydub()
+    max_chars_eff = _clamp_int(max_chars if max_chars is not None else _default_max_chars(), 80, 1200)
+    chunks = _chunk_text_for_tts(text, max_chars=max_chars_eff)
+    if not chunks:
+        raise RuntimeError("No text to synthesize.")
+
+    # If only one chunk, avoid pydub overhead.
+    if len(chunks) == 1:
+        _tts_to_file_speed(text=chunks[0], language=language, file_path=file_path, speed=None, tts_kwargs=tts_kwargs)
+        return
+
+    combined = None
+    seg_paths: list[Path] = []
+    try:
+        for idx, chunk in enumerate(chunks):
+            seg_path = unique_path(TMP_FOLDER, f".chunk{idx}.wav")
+            seg_paths.append(seg_path)
+            _tts_to_file_speed(text=chunk, language=language, file_path=seg_path, speed=None, tts_kwargs=tts_kwargs)
+            seg_audio = AudioSegment.from_wav(str(seg_path))
+            if combined is None:
+                combined = seg_audio
+            else:
+                # Small silence reduces audible run-ons between sentence chunks.
+                combined = combined + AudioSegment.silent(duration=120) + seg_audio
+
+        if combined is None:
+            raise RuntimeError("Failed to synthesize any audio chunks.")
+
+        combined.export(str(file_path), format="wav")
+    finally:
+        for p in seg_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _cleanup_old_jobs():
@@ -987,6 +1178,7 @@ def synthesize():
     data = request.get_json(force=True)
     text = (data.get("text") or "").strip()
     lang = data.get("lang", "en").strip().lower()
+    max_chars = data.get("max_chars", None)
 
     # Accept ref_ids (list) or ref_id (single string, backward compat)
     ref_ids = data.get("ref_ids") or []
@@ -1016,12 +1208,12 @@ def synthesize():
     out_path = unique_path(OUTPUT_FOLDER, ".wav")
 
     try:
-        _tts_to_file_speed(
+        _tts_to_file_chunked(
             text=text,
             language=lang,
             file_path=out_path,
-            speed=None,
             tts_kwargs={"speaker_wav": speaker_wav},
+            max_chars=max_chars,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1050,6 +1242,7 @@ def synthesize_builtin():
     # we keep the `speaker` field for UI compatibility.
     speaker = data.get("speaker", "Default")
     lang    = data.get("lang", "en").strip().lower()
+    max_chars = data.get("max_chars", None)
 
     if not text:
         return jsonify({"error": "text is required"}), 400
@@ -1059,12 +1252,12 @@ def synthesize_builtin():
     out_path = unique_path(OUTPUT_FOLDER, ".wav")
     try:
         # Default voice (no reference audio)
-        _tts_to_file_speed(
+        _tts_to_file_chunked(
             text=text,
             language=lang,
             file_path=out_path,
-            speed=None,
             tts_kwargs={},
+            max_chars=max_chars,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1105,9 +1298,21 @@ def list_outputs():
 
 @app.route("/delete-output/<file_id>", methods=["DELETE"])
 def delete_output(file_id: str):
-    p = OUTPUT_FOLDER / file_id
-    if p.exists():
+    # Containment check: resolve the target and confirm it stays inside
+    # OUTPUT_FOLDER, so a crafted file_id (e.g. "..%5Cfoo" on Windows, which
+    # bypasses Flask's slash-based routing) cannot delete files outside the
+    # outputs directory.
+    base = OUTPUT_FOLDER.resolve()
+    try:
+        p = (OUTPUT_FOLDER / file_id).resolve()
+    except (ValueError, OSError):
+        return jsonify({"error": "Invalid file id"}), 400
+    if not p.is_relative_to(base) or not p.is_file():
+        return jsonify({"error": "File not found"}), 404
+    try:
         p.unlink()
+    except OSError:
+        return jsonify({"error": "Could not delete file"}), 500
     return jsonify({"ok": True})
 
 

@@ -22,6 +22,7 @@ The app runs fully offline once the model is pre-downloaded.
 | WAV Download | One-click download of generated WAV files |
 | Subtitles (.srt) | Upload an `.srt` file and generate a single WAV/MP3 track aligned to subtitle start times |
 | History | Browse, preview, and delete all previously generated files |
+| Long-text reliability | Long input is chunked by sentence and stitched to reduce occasional truncation on long sentences |
 
 > Note on reference clips: `chatterbox-tts` voice conditioning takes a single `audio_prompt_path`.
 > The server accepts multiple uploads for API compatibility, but only the **first** clip is used.
@@ -31,6 +32,7 @@ The app runs fully offline once the model is pre-downloaded.
 - Python 3.10+ (recommended: **3.10–3.12** on Windows)
 - CUDA GPU recommended (CPU works but is slower)
 - Python deps installed via `requirements.txt` (includes `chatterbox-tts`, `torch`, `torchaudio`, `soundfile`, `numpy`)
+- `pydub` is used to stitch chunked WAV segments for long text (installed via `requirements.txt`)
 - Optional (for **MP3** output): **ffmpeg** installed and available as the `ffmpeg` command
 
 ## GPU / CUDA Acceleration
@@ -60,6 +62,22 @@ python app.py
 If CUDA is forced but not available, the server will log a warning and fall back to CPU.
 
 The web UI also shows a small **CPU / CUDA** badge at runtime (based on what the backend is using).
+
+## Long text chunking
+
+Some very long sentences can get truncated when synthesized in a single pass. To reduce this, the backend will split long input into sentence-like chunks and stitch the resulting audio into a single WAV.
+
+You can control the chunk size in two ways:
+
+1. **Environment variable default**
+```bash
+# Windows (PowerShell)
+$env:VOICECLONE_MAX_CHARS="260"   # default: 260 (clamped to 80..1200)
+python app.py
+```
+
+2. **UI override**
+In the web UI, set **Max chars / chunk** (in the Voice Cloning or Default Voice tab). Leaving it blank uses the environment-variable default.
 
 ## Download the Model (offline)
 
@@ -169,6 +187,8 @@ python app.py
 2. Select the output language (English / Chinese) and enter your text
 3. Click **Generate Speech**
 4. Preview the result in the browser, then click **Download WAV**
+
+> Note: for longer inputs, the backend automatically splits text into sentence-like chunks and stitches the generated audio into a single WAV. This helps avoid occasional truncation that can happen when synthesizing very long sentences in a single pass.
 
 ### Default Voice (no reference)
 The “Built-in Speakers” tab is kept for compatibility. Since chatterbox-tts is a **zero-shot** model (no discrete built-in speaker list),
