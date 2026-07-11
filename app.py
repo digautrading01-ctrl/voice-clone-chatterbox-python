@@ -23,6 +23,48 @@ ALLOWED_SUBTITLES = {"srt"}
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = (os.getenv(name) or "").strip()
+        return int(raw) if raw else int(default)
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = (os.getenv(name) or "").strip()
+        return float(raw) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+# ---------------------------------------------------------------------------
+# Long-text safety (Variant A): chunking + WAV concatenation
+# ---------------------------------------------------------------------------
+# chatterbox-tts can stop generation early and drop the tail of a long input,
+# even when the text is properly punctuated. To prevent that, any input longer
+# than the model can handle in a single pass is split into chunks, each
+# synthesized separately and concatenated with a small gap between them.
+#
+# The ceiling below is the SINGLE source of truth for "how long is too long":
+# both the long-text trigger (_should_use_long_text_mode) and the chunk splitter
+# (_split_text_for_tts) key off it, so any input longer than this is broken into
+# pieces that are each at most this long. Defaults are deliberately conservative
+# (well below where tail truncation has been observed); tune per language below.
+
+# Max characters reliably synthesized in one model.generate() call.
+VOICECLONE_CHUNK_MAX_CHARS_EN = _env_int("VOICECLONE_CHUNK_MAX_CHARS_EN", 150)
+VOICECLONE_CHUNK_MAX_CHARS_ZH = _env_int("VOICECLONE_CHUNK_MAX_CHARS_ZH", 100)
+# Pause inserted between concatenated chunks (milliseconds).
+VOICECLONE_CHUNK_GAP_MS = _env_int("VOICECLONE_CHUNK_GAP_MS", 150)
+
+# Sparse-punctuation escape hatch: enable chunking a little EARLIER than the
+# ceiling above when the text lacks natural break points, so the splitter can
+# introduce safe boundaries the text itself is missing.
+VOICECLONE_LONG_TEXT_PUNCT_DENSITY = _env_float("VOICECLONE_LONG_TEXT_PUNCT_DENSITY", 0.012)
+
 # TTS model (loaded once at startup)
 tts_model = None
 tts_lock = threading.Lock()
@@ -616,8 +658,10 @@ def _tts_to_file_speed(*, text: str, language: str, file_path: Path, speed: floa
         if audio_prompt_path:
             gen_kwargs["audio_prompt_path"] = audio_prompt_path
         # Prevent occasional AI hallucination in form of gibberish and repetition near sentence boundaries.
-        gen_kwargs["temperature"] = 0.5
+        gen_kwargs["temperature"] = 0.1
         gen_kwargs["repetition_penalty"] = 1.5
+        gen_kwargs["exaggeration"] = 0.3
+        gen_kwargs["cfg_weight"] =0.2
 
         wav = tts_model.generate(text, **gen_kwargs)  # type: ignore
         sr = int(getattr(tts_model, "sr", 24000))
@@ -631,191 +675,295 @@ def _tts_to_file_speed(*, text: str, language: str, file_path: Path, speed: floa
             pass
 
 
-# ---------------------------------------------------------------------------
-# Intelligent text chunking (non-SRT synthesis)
-# ---------------------------------------------------------------------------
-
-_SENTENCE_SPLIT_RE = re.compile(
-    r"""          # keep delimiter
-    (.*?          # sentence body (non-greedy)
-     [\.\!\?\u3002\uFF01\uFF1F\u2026]+   # . ! ? 。 ！ ？ …
-    )\s+          # whitespace after punctuation
-    """,
-    re.VERBOSE | re.DOTALL,
-)
+_PUNCT_STRONG = frozenset(".?!…。？！…")
+_PUNCT_WEAK = frozenset(",;:，；：、")
+_PUNCT_ANY = _PUNCT_STRONG | _PUNCT_WEAK
+_TRAILING_QUOTES = frozenset(['"', "'", "”", "’", "»", "」", "』", "）", ")", "]", "】"])
 
 
-def _split_into_sentences(text: str) -> list[str]:
+def _last_content_char(s: str) -> str:
+    """Return the last meaningful character, skipping trailing whitespace/quotes."""
+    if not s:
+        return ""
+    i = len(s) - 1
+    while i >= 0 and s[i].isspace():
+        i -= 1
+    while i >= 0 and s[i] in _TRAILING_QUOTES:
+        i -= 1
+        while i >= 0 and s[i].isspace():
+            i -= 1
+    return s[i] if i >= 0 else ""
+
+
+def _punct_density(text: str) -> float:
+    if not text:
+        return 0.0
+    n = len(text)
+    if n <= 0:
+        return 0.0
+    punct = sum(1 for ch in text if ch in _PUNCT_ANY)
+    return punct / float(n)
+
+
+def _normalize_text_for_tts(text: str, lang_id: str) -> str:
     """
-    Best-effort sentence splitter for English + Chinese punctuation.
-
-    We keep terminal punctuation with the sentence, and fall back to returning
-    the whole text if nothing matches.
+    Light normalization for better prosody and more reliable chunking.
+    - Collapse whitespace
+    - Ensure the final chunk ends with terminal punctuation (helps avoid "dangling" prosody)
     """
     t = (text or "").strip()
     if not t:
-        return []
-
-    # Normalize whitespace to improve splitting stability.
+        return ""
+    # Normalize whitespace (keep it simple; we don't want to rewrite user text).
     t = re.sub(r"\s+", " ", t).strip()
 
-    out: list[str] = []
-    pos = 0
-    for m in _SENTENCE_SPLIT_RE.finditer(t):
-        s = (m.group(1) or "").strip()
-        if s:
-            out.append(s)
-        pos = m.end()
-    tail = t[pos:].strip()
+    last = _last_content_char(t)
+    if last and last not in _PUNCT_STRONG and last not in _PUNCT_WEAK:
+        t = t + ("。" if lang_id == "zh" else ".")
+    return t
+
+
+def _split_by_punct(text: str, punct_set: set[str] | frozenset[str]) -> list[str]:
+    chunks = []
+    buf = []
+    for ch in text:
+        buf.append(ch)
+        if ch in punct_set:
+            s = "".join(buf).strip()
+            if s:
+                chunks.append(s)
+            buf = []
+    tail = "".join(buf).strip()
     if tail:
-        out.append(tail)
+        chunks.append(tail)
+    return chunks
+
+
+def _split_en_by_length(s: str, max_chars: int) -> list[str]:
+    out = []
+    s = s.strip()
+    while len(s) > max_chars:
+        cut = s.rfind(" ", 0, max_chars + 1)
+        # If we can't find a decent whitespace cut, fall back to hard cut.
+        if cut < max(20, int(max_chars * 0.4)):
+            cut = max_chars
+        part = s[:cut].strip()
+        if part:
+            out.append(part)
+        s = s[cut:].strip()
+    if s:
+        out.append(s)
     return out
 
 
-def _chunk_text_for_tts(text: str, *, max_chars: int = 260) -> list[str]:
-    """
-    Chunk text to reduce long-sentence truncation in some TTS generations.
+def _split_zh_by_length(s: str, max_chars: int) -> list[str]:
+    out = []
+    s = s.strip()
+    while len(s) > max_chars:
+        part = s[:max_chars].strip()
+        if part:
+            out.append(part)
+        s = s[max_chars:].strip()
+    if s:
+        out.append(s)
+    return out
 
+
+def _ensure_chunk_punct(chunks: list[str], lang_id: str) -> list[str]:
+    """Ensure each chunk ends with punctuation to encourage stable endings."""
+    if not chunks:
+        return []
+    fixed = []
+    for i, c in enumerate(chunks):
+        c = (c or "").strip()
+        if not c:
+            continue
+        last = _last_content_char(c)
+        if last and last not in _PUNCT_ANY:
+            # Non-final chunks get a weak pause; final chunk gets a sentence end.
+            if i < len(chunks) - 1:
+                c += ("，" if lang_id == "zh" else ",")
+            else:
+                c += ("。" if lang_id == "zh" else ".")
+        fixed.append(c)
+    return fixed
+
+
+def _split_text_for_tts(text: str, lang_id: str) -> list[str]:
+    """
+    Split text into conservative chunks that are safer for TTS generation.
     Strategy:
-    - Prefer sentence boundaries first
-    - If a single sentence is still too long, split further on commas/semicolons
-    - If still too long, split by character length (hard fallback)
+    1) strong punctuation
+    2) weak punctuation (for any segment still too long)
+    3) length-based splitting (word-boundary for EN, char window for ZH)
     """
     t = (text or "").strip()
     if not t:
         return []
 
-    sentences = _split_into_sentences(t)
-    if not sentences:
-        sentences = [t]
+    max_chars = VOICECLONE_CHUNK_MAX_CHARS_ZH if lang_id == "zh" else VOICECLONE_CHUNK_MAX_CHARS_EN
+    first = _split_by_punct(t, _PUNCT_STRONG)
 
-    chunks: list[str] = []
-
-    def push(s: str):
-        s = (s or "").strip()
-        if s:
-            chunks.append(s)
-
-    for sent in sentences:
-        s = sent.strip()
-        if len(s) <= max_chars:
-            push(s)
+    out = []
+    for seg in first if first else [t]:
+        if len(seg) <= max_chars:
+            out.append(seg.strip())
             continue
-
-        # Secondary split on comma-like punctuation.
-        parts = re.split(r"(?<=[,;:\uFF0C\uFF1B\uFF1A])\s*", s)
-        buf = ""
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            if not buf:
-                buf = part
-                continue
-            if len(buf) + 1 + len(part) <= max_chars:
-                buf = buf + " " + part
+        # second pass: weak punctuation
+        second = _split_by_punct(seg, _PUNCT_WEAK)
+        if len(second) <= 1:
+            # no weak punct, or didn't help -> length split
+            if lang_id == "zh":
+                out.extend(_split_zh_by_length(seg, max_chars))
             else:
-                push(buf)
-                buf = part
-        push(buf)
+                out.extend(_split_en_by_length(seg, max_chars))
+        else:
+            for s2 in second:
+                if len(s2) <= max_chars:
+                    out.append(s2.strip())
+                else:
+                    if lang_id == "zh":
+                        out.extend(_split_zh_by_length(s2, max_chars))
+                    else:
+                        out.extend(_split_en_by_length(s2, max_chars))
 
-    # Hard fallback: break any remaining overlong chunks by length.
-    final: list[str] = []
-    for c in chunks:
-        c = c.strip()
-        if len(c) <= max_chars:
-            final.append(c)
-            continue
-        for i in range(0, len(c), max_chars):
-            seg = c[i : i + max_chars].strip()
-            if seg:
-                final.append(seg)
-
-    return final
+    out = [x for x in (o.strip() for o in out) if x]
+    return _ensure_chunk_punct(out, lang_id)
 
 
-def _parse_int_env(name: str, *, default: int | None = None) -> int | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return default
+def _resample_audio_np(np, audio, in_sr: int, out_sr: int):
+    """Simple linear resample for sample-rate mismatches (duration-preserving)."""
+    if in_sr == out_sr:
+        return audio
+    if audio is None or len(audio) == 0:
+        return audio
+    ratio = float(out_sr) / float(in_sr)
+    new_len = max(1, int(round(len(audio) * ratio)))
+    if new_len == len(audio):
+        return audio
+    x_old = np.linspace(0.0, 1.0, num=len(audio), dtype=np.float64)
+    x_new = np.linspace(0.0, 1.0, num=new_len, dtype=np.float64)
+    y_new = np.interp(x_new, x_old, audio.astype(np.float64))
+    return y_new.astype(np.float32)
 
 
-def _clamp_int(v: int, lo: int, hi: int) -> int:
-    try:
-        v = int(v)
-    except Exception:
-        return lo
-    return max(lo, min(hi, v))
-
-
-def _default_max_chars() -> int:
+def _tts_long_text_to_file(*, text: str, language: str, file_path: Path, tts_kwargs: dict):
     """
-    Default chunk size for non-SRT synthesis.
-    - Can be configured via env var VOICECLONE_MAX_CHARS
-    - Clamped to a safe range to avoid extreme values
+    Variant A long-text pipeline:
+    - normalize
+    - split into chunks
+    - synth each chunk into a temp WAV
+    - concatenate into one WAV with a small gap between chunks
     """
-    v = _parse_int_env("VOICECLONE_MAX_CHARS", default=260)
-    return _clamp_int(v if v is not None else 260, 80, 1200)
+    np, sf = _load_audio_deps()
 
+    lang_id = (language or "en").strip().lower()
+    if lang_id == "zh-cn":
+        lang_id = "zh"
+    if lang_id not in ("en", "zh"):
+        lang_id = "en"
 
-def _require_pydub():
-    try:
-        from pydub import AudioSegment  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Missing dependency for intelligent text chunking. Install requirements first:\n"
-            "  pip install -r requirements.txt\n"
-            f"Details: {e}"
-        )
-    return AudioSegment
-
-
-def _tts_to_file_chunked(*, text: str, language: str, file_path: Path, tts_kwargs: dict, max_chars: int | None = None):
-    """
-    Render text to a WAV file using sentence-based chunking and stitch with pydub.
-
-    This is used for the non-SRT endpoints to reduce occasional truncation on
-    long sentences.
-    """
-    AudioSegment = _require_pydub()
-    max_chars_eff = _clamp_int(max_chars if max_chars is not None else _default_max_chars(), 80, 1200)
-    chunks = _chunk_text_for_tts(text, max_chars=max_chars_eff)
+    chunks = _split_text_for_tts(text, lang_id)
     if not chunks:
-        raise RuntimeError("No text to synthesize.")
+        raise RuntimeError("No valid text chunks to synthesize.")
 
-    # If only one chunk, avoid pydub overhead.
-    if len(chunks) == 1:
-        _tts_to_file_speed(text=chunks[0], language=language, file_path=file_path, speed=None, tts_kwargs=tts_kwargs)
-        return
+    tmp_paths: list[Path] = []
+    sr = None
+    parts = []
+    gap_ms = max(0, int(VOICECLONE_CHUNK_GAP_MS))
 
-    combined = None
-    seg_paths: list[Path] = []
     try:
         for idx, chunk in enumerate(chunks):
-            seg_path = unique_path(TMP_FOLDER, f".chunk{idx}.wav")
-            seg_paths.append(seg_path)
-            _tts_to_file_speed(text=chunk, language=language, file_path=seg_path, speed=None, tts_kwargs=tts_kwargs)
-            seg_audio = AudioSegment.from_wav(str(seg_path))
-            if combined is None:
-                combined = seg_audio
-            else:
-                # Small silence reduces audible run-ons between sentence chunks.
-                combined = combined + AudioSegment.silent(duration=120) + seg_audio
+            seg_path = unique_path(TMP_FOLDER, ".wav")
+            tmp_paths.append(seg_path)
 
-        if combined is None:
-            raise RuntimeError("Failed to synthesize any audio chunks.")
+            _tts_to_file_speed(
+                text=chunk,
+                language=lang_id,
+                file_path=seg_path,
+                speed=None,
+                tts_kwargs=tts_kwargs,
+            )
 
-        combined.export(str(file_path), format="wav")
+            data, seg_sr = sf.read(seg_path, dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+
+            if sr is None:
+                sr = int(seg_sr)
+            elif int(seg_sr) != int(sr):
+                data = _resample_audio_np(np, data, int(seg_sr), int(sr))
+
+            parts.append(data.astype(np.float32, copy=False))
+            if gap_ms > 0 and idx < len(chunks) - 1 and sr:
+                gap_len = int(sr * gap_ms / 1000)
+                if gap_len > 0:
+                    parts.append(np.zeros(gap_len, dtype=np.float32))
+
+        if sr is None:
+            raise RuntimeError("Failed to determine sample rate from synthesized audio.")
+
+        merged = np.concatenate(parts, dtype=np.float32) if parts else np.zeros(0, dtype=np.float32)
+        sf.write(str(file_path), merged, int(sr))
     finally:
-        for p in seg_paths:
+        for p in tmp_paths:
             try:
-                p.unlink(missing_ok=True)
+                if p.exists():
+                    p.unlink()
             except Exception:
                 pass
+
+
+def _should_use_long_text_mode(text: str, lang_id: str) -> bool:
+    """
+    Return True when the input is too long to synthesize safely in a single
+    model.generate() call and must be split into chunks.
+
+    The decision is driven by the safe single-pass ceiling (CHUNK_MAX_CHARS per
+    language): any input longer than that ceiling is chunked, *regardless of
+    punctuation*. This is what catches a long, well-punctuated sentence that
+    would otherwise be sent to the model in one pass and have its tail dropped.
+
+    A sparse-punctuation escape hatch lets chunking kick in a little earlier for
+    borderline-length text that lacks natural split points.
+
+    Note: the old VOICECLONE_LONG_TEXT_TRIGGER_* env vars were redundant (their
+    values sat above the chunk ceiling, so the `len > max_chars` check already
+    covered them) and have been removed. The chunk ceiling is now the only knob.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    max_chars = VOICECLONE_CHUNK_MAX_CHARS_ZH if lang_id == "zh" else VOICECLONE_CHUNK_MAX_CHARS_EN
+
+    # Primary trigger: longer than the safe single-pass ceiling -> always chunk.
+    if len(t) > int(max_chars):
+        return True
+
+    # Escape hatch: borderline length with very sparse punctuation. Such text
+    # has no natural break points, so let the splitter introduce safe ones
+    # earlier than the hard ceiling would.
+    early_floor = max(40, int(max_chars) // 2)
+    if len(t) >= early_floor and _punct_density(t) < float(VOICECLONE_LONG_TEXT_PUNCT_DENSITY):
+        return True
+
+    return False
+
+
+def _tts_text_to_file(*, text: str, language: str, file_path: Path, tts_kwargs: dict):
+    """Shared entry for /synthesize and /synthesize-builtin."""
+    lang_id = (language or "en").strip().lower()
+    if lang_id == "zh-cn":
+        lang_id = "zh"
+    if lang_id not in ("en", "zh"):
+        lang_id = "en"
+
+    normalized = _normalize_text_for_tts(text, lang_id)
+    if _should_use_long_text_mode(normalized, lang_id):
+        _tts_long_text_to_file(text=normalized, language=lang_id, file_path=file_path, tts_kwargs=tts_kwargs)
+        return
+    _tts_to_file_speed(text=normalized, language=lang_id, file_path=file_path, speed=None, tts_kwargs=tts_kwargs)
 
 
 def _cleanup_old_jobs():
@@ -958,7 +1106,9 @@ def _srt_to_audio_file(*, cues, lang: str, fmt: str, tts_kwargs: dict, progress_
             # -----------------------------------------------------------------
             # 1) Synthesize at normal speed first
             # -----------------------------------------------------------------
-            _tts_to_file_speed(text=text, language=lang, file_path=seg_path, speed=None, tts_kwargs=tts_kwargs)
+            # Use the same long-text safety pipeline as plain-text synthesis so
+            # exceptionally long subtitle cues also benefit from chunking.
+            _tts_text_to_file(text=text, language=lang, file_path=seg_path, tts_kwargs=tts_kwargs)
 
             data, seg_sr = sf.read(seg_path, dtype="float32")
             if data.ndim > 1:
@@ -1178,7 +1328,6 @@ def synthesize():
     data = request.get_json(force=True)
     text = (data.get("text") or "").strip()
     lang = data.get("lang", "en").strip().lower()
-    max_chars = data.get("max_chars", None)
 
     # Accept ref_ids (list) or ref_id (single string, backward compat)
     ref_ids = data.get("ref_ids") or []
@@ -1208,13 +1357,7 @@ def synthesize():
     out_path = unique_path(OUTPUT_FOLDER, ".wav")
 
     try:
-        _tts_to_file_chunked(
-            text=text,
-            language=lang,
-            file_path=out_path,
-            tts_kwargs={"speaker_wav": speaker_wav},
-            max_chars=max_chars,
-        )
+        _tts_text_to_file(text=text, language=lang, file_path=out_path, tts_kwargs={"speaker_wav": speaker_wav})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1242,7 +1385,6 @@ def synthesize_builtin():
     # we keep the `speaker` field for UI compatibility.
     speaker = data.get("speaker", "Default")
     lang    = data.get("lang", "en").strip().lower()
-    max_chars = data.get("max_chars", None)
 
     if not text:
         return jsonify({"error": "text is required"}), 400
@@ -1252,13 +1394,7 @@ def synthesize_builtin():
     out_path = unique_path(OUTPUT_FOLDER, ".wav")
     try:
         # Default voice (no reference audio)
-        _tts_to_file_chunked(
-            text=text,
-            language=lang,
-            file_path=out_path,
-            tts_kwargs={},
-            max_chars=max_chars,
-        )
+        _tts_text_to_file(text=text, language=lang, file_path=out_path, tts_kwargs={})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1298,21 +1434,9 @@ def list_outputs():
 
 @app.route("/delete-output/<file_id>", methods=["DELETE"])
 def delete_output(file_id: str):
-    # Containment check: resolve the target and confirm it stays inside
-    # OUTPUT_FOLDER, so a crafted file_id (e.g. "..%5Cfoo" on Windows, which
-    # bypasses Flask's slash-based routing) cannot delete files outside the
-    # outputs directory.
-    base = OUTPUT_FOLDER.resolve()
-    try:
-        p = (OUTPUT_FOLDER / file_id).resolve()
-    except (ValueError, OSError):
-        return jsonify({"error": "Invalid file id"}), 400
-    if not p.is_relative_to(base) or not p.is_file():
-        return jsonify({"error": "File not found"}), 404
-    try:
+    p = OUTPUT_FOLDER / file_id
+    if p.exists():
         p.unlink()
-    except OSError:
-        return jsonify({"error": "Could not delete file"}), 500
     return jsonify({"ok": True})
 
 

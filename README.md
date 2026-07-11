@@ -22,7 +22,6 @@ The app runs fully offline once the model is pre-downloaded.
 | WAV Download | One-click download of generated WAV files |
 | Subtitles (.srt) | Upload an `.srt` file and generate a single WAV/MP3 track aligned to subtitle start times |
 | History | Browse, preview, and delete all previously generated files |
-| Long-text reliability | Long input is chunked by sentence and stitched to reduce occasional truncation on long sentences |
 
 > Note on reference clips: `chatterbox-tts` voice conditioning takes a single `audio_prompt_path`.
 > The server accepts multiple uploads for API compatibility, but only the **first** clip is used.
@@ -32,7 +31,6 @@ The app runs fully offline once the model is pre-downloaded.
 - Python 3.10+ (recommended: **3.10–3.12** on Windows)
 - CUDA GPU recommended (CPU works but is slower)
 - Python deps installed via `requirements.txt` (includes `chatterbox-tts`, `torch`, `torchaudio`, `soundfile`, `numpy`)
-- `pydub` is used to stitch chunked WAV segments for long text (installed via `requirements.txt`)
 - Optional (for **MP3** output): **ffmpeg** installed and available as the `ffmpeg` command
 
 ## GPU / CUDA Acceleration
@@ -62,22 +60,6 @@ python app.py
 If CUDA is forced but not available, the server will log a warning and fall back to CPU.
 
 The web UI also shows a small **CPU / CUDA** badge at runtime (based on what the backend is using).
-
-## Long text chunking
-
-Some very long sentences can get truncated when synthesized in a single pass. To reduce this, the backend will split long input into sentence-like chunks and stitch the resulting audio into a single WAV.
-
-You can control the chunk size in two ways:
-
-1. **Environment variable default**
-```bash
-# Windows (PowerShell)
-$env:VOICECLONE_MAX_CHARS="260"   # default: 260 (clamped to 80..1200)
-python app.py
-```
-
-2. **UI override**
-In the web UI, set **Max chars / chunk** (in the Voice Cloning or Default Voice tab). Leaving it blank uses the environment-variable default.
 
 ## Download the Model (offline)
 
@@ -187,8 +169,6 @@ python app.py
 2. Select the output language (English / Chinese) and enter your text
 3. Click **Generate Speech**
 4. Preview the result in the browser, then click **Download WAV**
-
-> Note: for longer inputs, the backend automatically splits text into sentence-like chunks and stitches the generated audio into a single WAV. This helps avoid occasional truncation that can happen when synthesizing very long sentences in a single pass.
 
 ### Default Voice (no reference)
 The “Built-in Speakers” tab is kept for compatibility. Since chatterbox-tts is a **zero-shot** model (no discrete built-in speaker list),
@@ -336,6 +316,22 @@ A: The `./model/` folder is missing or empty. Pre-download the Chatterbox model 
 
 **Q: I get `expected scalar type Float but found Double` (usually with Turbo).**  
 A: Some Turbo checkpoints can contain float64 tensors. This project forces model weights and cached conditionals to float32 at load time to avoid this error. Make sure you’re running the updated `app.py`, then restart the server.
+
+**Q: Long sentences get truncated (the tail is missing).**  
+A: chatterbox-tts can stop generation early and drop the tail of a long input — **even when the sentence is properly punctuated.** To prevent that, this project splits any input longer than the model can handle in a single pass into chunks, synthesizes each chunk separately, and concatenates the resulting WAV pieces with a small pause between them. This applies to both plain-text synthesis and individual `.srt` subtitle cues.
+
+The chunking trigger and the chunk size are the **same** value: the safe single-pass ceiling. Any text longer than that ceiling is split into pieces that are each at most that long, so individual chunks stay within the model's reliable range. You can tune the ceiling per language:
+
+```bash
+# Windows (PowerShell) examples
+$env:VOICECLONE_CHUNK_MAX_CHARS_EN="150"      # max chars per single model pass (English)
+$env:VOICECLONE_CHUNK_MAX_CHARS_ZH="100"      # max chars per single model pass (Chinese)
+$env:VOICECLONE_CHUNK_GAP_MS="150"            # pause inserted between chunks (ms)
+$env:VOICECLONE_LONG_TEXT_PUNCT_DENSITY="0.012" # enable chunking a little earlier when punctuation is sparse
+python app.py
+```
+
+> Defaults (150 EN / 100 ZH) are deliberately conservative. If you still see tail truncation on long, well-punctuated sentences, lower the relevant `VOICECLONE_CHUNK_MAX_CHARS_*` value further; if synthesis of long documents is slower than you'd like because it over-chunks, raise it. The previous `VOICECLONE_LONG_TEXT_TRIGGER_*` env vars have been removed — they were redundant (their values sat above the chunk ceiling, so the length check already covered them) and left a gap where well-punctuated mid-length sentences bypassed chunking entirely.
 
 **Q: MP3 export fails with an error about `ffmpeg`.**  
 A: MP3 output requires **ffmpeg**. Install ffmpeg and ensure the `ffmpeg` command works in your terminal, then retry.
